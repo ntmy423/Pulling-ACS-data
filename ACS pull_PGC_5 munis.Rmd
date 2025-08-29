@@ -1,0 +1,180 @@
+---
+title: "ACS Pull"
+author: "My Nguyen"
+date: "2025-08-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = TRUE, warning = FALSE)
+```
+
+```{r}
+
+# Packages
+library(readxl)
+library(openxlsx)
+library(readr)
+library(dplyr)
+library(tidyr)
+library(sf)
+library(lwgeom)
+library(mapview)
+library(tidycensus)
+library(tigris)
+library(kableExtra)
+library(stringr)
+library(lubridate)
+
+sf::sf_use_s2(FALSE)
+options(tigris_use_cache = TRUE)
+
+```
+
+```{r}
+# Working directory
+working_dir_acs <- "C:/Users/mnguyen/OneDrive - Econsult Solutions Inc"
+setwd(working_dir_acs)
+```
+
+```{r}
+# Read variable workbook (same style you’re using)
+acs_variables <- read_excel("acs_economic_variables.xlsx", sheet = "variables") %>% 
+  mutate(
+    table   = str_extract(name, "^[^_]+"),
+    var_name = str_extract(label, "[^!]+$")
+  ) %>% 
+  distinct()
+
+acs_grouping <- read_xlsx("acs_economic_variables.xlsx", sheet = "grouping") %>% 
+  rename(variable = name)
+```
+
+```{r}
+# Census API key (use existing if installed already)
+if (Sys.getenv("CENSUS_API_KEY") == "") {
+  your_key <- "1a9a4573ba63a9ec3f543b0aec1920ed1d9483eb"
+  tidycensus::census_api_key(your_key, install = TRUE, overwrite = TRUE)
+  readRenviron("~/.Renviron")   # reload without restarting R
+}
+stored <- Sys.getenv("CENSUS_API_KEY")
+stopifnot(nchar(stored) > 0)
+message("Census key loaded. Starts with: ", substr(stored, 1, 6), " …")
+
+years <- c(2014, 2023)
+state <- "MD"
+survey <- "acs5"
+geometry <- FALSE
+
+# Target places in Prince George's County
+target_places <- c(
+  "Bowie city, Maryland",
+  "College Park city, Maryland",
+  "Greenbelt city, Maryland",
+  "Hyattsville city, Maryland",
+  "New Carrollton city, Maryland"
+)
+
+# Variables needed for required metrics
+# - We include both B01001_001 and B01003_001 as fallbacks for Total Population
+vars_needed <- c(
+  "B01001_001",  # Total population (sex by age) - fallback for B01003
+  "B01003_001",  # Total population
+  "B23025_001",  # Civilian population 16+ (LF universe)
+  "B23025_002",  # In labor force
+  "B11001_001",  # Total households
+  "B25010_001",  # Average household size of occupied HU
+  "B19013_001",  # Median household income
+  "B25077_001",  # Median housing value
+  "B01002_001"   # Median age (years)
+)
+
+# Helper: return only variables that exist in that year
+valid_vars_for_year <- function(year, var_ids) {
+  available <- load_variables(year = year, dataset = survey, cache = TRUE)$name
+  var_ids[var_ids %in% available]
+}
+
+# Pull ACS for MD places, filter to the 5 target cities, compute metrics
+pull_places_year <- function(year) {
+  valid_vars <- valid_vars_for_year(year, vars_needed)
+  if (length(valid_vars) == 0) {
+    message(paste0("No valid variables for year ", year, "."))
+    return(NULL)
+  }
+  
+  df_wide <- get_acs(
+    geography   = "place",
+    state       = state,
+    variables   = valid_vars,
+    year        = year,
+    survey      = survey,
+    geometry    = geometry,
+    cache_table = TRUE,
+    output      = "wide"
+  ) %>%
+    filter(NAME %in% target_places)
+  
+  # Compute outputs
+  out <- df_wide %>%
+    transmute(
+      Place = NAME,
+      GEOID,
+      year  = year,
+      Population = dplyr::coalesce(B01001_001E, B01003_001E),
+      `Labor Force Participation (%)` = dplyr::if_else(
+        !is.na(B23025_001E) & B23025_001E > 0,
+        100 * B23025_002E / B23025_001E, 
+        NA_real_
+      ),
+      Households = B11001_001E,
+      `Average household size` = B25010_001E,
+      `Median household income` = B19013_001E,
+      `Median housing value` = B25077_001E,
+      `Median age (years)` = B01002_001E
+    )
+  
+  out
+}
+
+# Run for both years and combine
+acs_cities <- bind_rows(lapply(years, pull_places_year)) %>%
+  arrange(Place, year)
+```
+
+```{r}
+# Preview and nicely format
+acs_cities %>% 
+  mutate(
+    `Labor Force Participation (%)` = round(`Labor Force Participation (%)`, 1),
+    `Average household size` = round(`Average household size`, 2),
+    `Median household income` = scales::dollar(`Median household income`),
+    `Median housing value` = scales::dollar(`Median housing value`),
+    Population = scales::comma(Population),
+    Households = scales::comma(Households)
+  ) %>% 
+  kable(align = "lrrrrrrr") %>% 
+  kable_styling(full_width = FALSE)
+
+```
+
+
+```{r}
+# Save a clean CSV (unformatted numerics)
+out_path <- file.path(working_dir_acs, "ACS_cities_2014_2023.csv")
+
+# ensure folder exists
+dir.create(dirname(out_path), recursive = TRUE, showWarnings = FALSE)
+
+# write and confirm
+readr::write_csv(acs_cities, out_path)
+
+if (file.exists(out_path)) {
+  message("Saved: ", normalizePath(out_path))
+} else {
+  stop("Save failed: file not found at ", out_path)
+}
+```
+
+
+
